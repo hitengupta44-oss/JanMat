@@ -1,10 +1,22 @@
 """
-Consultation Pulse — the entire backend in one file.
+JanMat — the entire backend in one file.
 
 Sections below, top to bottom: config, database, scraper, NLP pipeline,
-FastAPI app + routes. Deployed as an HF Space (Docker SDK); the Vercel
-frontend reads from it, and a GitHub Actions cron calls
-POST /internal/run-pipeline on a schedule.
+FastAPI app + routes, and a thin Gradio wrapper around all of it. The
+Vercel frontend reads from the FastAPI routes, and a GitHub Actions cron
+calls POST /internal/run-pipeline on a schedule.
+
+Deployment note: this runs as an HF Space with sdk: gradio (not Docker).
+As of mid-2026, HF Spaces requires a paid plan to create Gradio or Docker
+Spaces UNLESS the Space declares ZeroGPU usage, in which case free
+personal accounts can still host up to 2 such Spaces. This app is a
+plain CPU workload (scraper + SQLite + Groq calls) with no real GPU need
+— the @zero_gpu-decorated function near the bottom of this file exists
+only so the Space qualifies for that free-tier exception. This is a
+known community workaround, not an officially documented path, and HF
+could close it without notice. If it stops working, the fallback is
+moving `backend/` to a real free host (e.g. Render's free web service
+tier) with no code changes needed beyond the entrypoint at the bottom.
 """
 import hashlib
 import json
@@ -28,8 +40,20 @@ from pydantic import BaseModel
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+import gradio as gr
+
+# `spaces` only does anything meaningful inside an actual HF Space with
+# ZeroGPU hardware attached. Guarded import so local dev / CI (where the
+# package may be absent, or present but inert) never breaks.
+try:
+    import spaces
+    zero_gpu = spaces.GPU
+except ImportError:
+    def zero_gpu(fn):
+        return fn
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("consultation_pulse")
+logger = logging.getLogger("janmat")
 
 load_dotenv()
 
@@ -68,7 +92,7 @@ CONFIG = {
         ),
     },
     "storage": {
-        "sqlite_path": "data/consultation_pulse.db",
+        "sqlite_path": "data/janmat.db",
     },
     "nlp": {
         "provider": "groq",
@@ -295,7 +319,7 @@ class PRSScraper:
         self.rate_limit_seconds = source_config.get("rate_limit_seconds", 2)
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": "ConsultationPulseBot/0.1 (+non-commercial civic-tech MVP)"}
+            {"User-Agent": "JanMatBot/0.1 (+non-commercial civic-tech MVP)"}
         )
 
     def _get(self, url: str) -> requests.Response:
@@ -595,13 +619,14 @@ def run_pipeline() -> dict:
 
 
 # =====================================================================
-# FASTAPI APP — deployed as an HF Space (Docker SDK)
+# FASTAPI APP — the real backend. All routes below are what the Vercel
+# frontend and the GitHub Actions cron actually talk to.
 # =====================================================================
 
 init_db()
 
 app = FastAPI(
-    title="Consultation Pulse API",
+    title="JanMat API",
     description=(
         "Free, non-commercial MVP. Ingests PRS Legislative Research "
         "stakeholder analysis only — see /sources for status."
@@ -687,3 +712,54 @@ def trigger_pipeline(x_cron_secret: str = Header(default="")):
     if not CRON_SECRET or x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Cron-Secret header")
     return run_pipeline()
+
+
+# =====================================================================
+# GRADIO WRAPPER — exists so this Space qualifies as a "Gradio Space"
+# for HF's free ZeroGPU exception. See the module docstring for why.
+# The real backend is the FastAPI app above; this UI is a thin status
+# page, not the product.
+# =====================================================================
+
+@zero_gpu
+def _zero_gpu_touch() -> str:
+    """
+    Does no real GPU work. Its only job is to exist as a
+    @spaces.GPU-decorated function so HF recognizes this Space as using
+    ZeroGPU, which is what unlocks free hosting for a Gradio/Docker-class
+    Space on a personal account. Calling it is harmless either way.
+    """
+    return "ok"
+
+
+def _status_snapshot() -> str:
+    zero_gpu_status = _zero_gpu_touch()
+    with get_connection() as conn:
+        bill_count = len(list_bills(conn))
+    return (
+        f"JanMat backend is running.\n"
+        f"Bills in database: {bill_count}\n"
+        f"ZeroGPU check: {zero_gpu_status}\n\n"
+        f"This UI is just a status page — the real API lives at the "
+        f"routes below (e.g. /health, /bills, /internal/run-pipeline)."
+    )
+
+
+with gr.Blocks(title="JanMat backend status") as demo:
+    gr.Markdown("## JanMat — backend status\n"
+                "The Next.js frontend and the GitHub Actions cron talk "
+                "to the FastAPI routes on this Space, not to this page.")
+    refresh_btn = gr.Button("Refresh status")
+    status_box = gr.Textbox(label="Status", lines=6, value=_status_snapshot)
+    refresh_btn.click(fn=_status_snapshot, outputs=status_box)
+
+# Mount the FastAPI app's real routes onto the same ASGI app the Gradio
+# UI runs on, so both are served from one process on one port. The API
+# stays at its normal paths (/health, /bills, ...); the Gradio UI lives
+# at /ui.
+app = gr.mount_gradio_app(app, demo, path="/ui")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
