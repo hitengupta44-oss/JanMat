@@ -1,5 +1,13 @@
-# Hugging Face Spaces — Docker SDK
-# Space settings: SDK = Docker, this file at repo root of the Space (backend/ folder)
+# NOT USED in the default deploy path (see README.md — that path uses
+# sdk: gradio, which HF's free ZeroGPU exception covers for personal
+# accounts). Docker Spaces require a paid HF plan as of mid-2026.
+#
+# Kept here for two cases: (1) you're on a paid HF plan and prefer
+# Docker SDK's full control, or (2) you're deploying this backend to
+# any other Docker-based host (Render, Railway, Fly.io, etc.) instead.
+# If using this, remove/ignore the `if __name__ == "__main__"` uvicorn
+# call at the bottom of app.py and run uvicorn from CMD as before, since
+# a Docker host won't need the Gradio-mounting shim.
 FROM python:3.11-slim
 
 WORKDIR /app
