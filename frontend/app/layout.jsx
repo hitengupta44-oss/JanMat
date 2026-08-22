@@ -1,7 +1,7 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Consultation Pulse — Public Consultation Register",
+  title: "JanMat — Public Consultation Register",
   description:
     "A plain-language snapshot of public feedback on tracked bills, built from PRS Legislative Research stakeholder analysis.",
 };
