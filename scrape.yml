@@ -1,0 +1,30 @@
+name: Scheduled scrape + NLP pipeline
+
+# Calls the live HF Space's protected endpoint on a schedule, so the
+# scraper and Groq calls run in the Space's own environment/storage
+# rather than in CI (avoids syncing SQLite between two runtimes).
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours - adjust to taste
+  workflow_dispatch: {}       # lets you trigger a run manually from the Actions tab
+
+jobs:
+  trigger-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /internal/run-pipeline on the HF Space
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}       # e.g. https://your-space.hf.space
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}        # must match the Space's CRON_SECRET
+        run: |
+          set -e
+          http_code=$(curl -s -o response.json -w "%{http_code}" \
+            -X POST "$BACKEND_URL/internal/run-pipeline" \
+            -H "X-Cron-Secret: $CRON_SECRET" \
+            --max-time 300)
+          echo "Response:"
+          cat response.json
+          if [ "$http_code" -ge 300 ]; then
+            echo "Pipeline call failed with HTTP $http_code"
+            exit 1
+          fi
