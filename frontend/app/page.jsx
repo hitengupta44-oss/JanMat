@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Consultation Pulse — the entire UI in one file.
+ * JanMat — the entire UI in one file.
  *
  * Fetches from the FastAPI backend (NEXT_PUBLIC_API_BASE_URL), renders the
  * bill register, and expands each row into its themes on click. The stamp
@@ -187,7 +187,7 @@ export default function Page() {
           Public Consultation Register
         </p>
         <h1 className="font-display text-4xl sm:text-5xl text-ink font-semibold leading-tight">
-          Consultation Pulse
+          JanMat
         </h1>
         <p className="font-body text-sm text-ink-faint mt-3 max-w-xl leading-relaxed">
           A plain-language snapshot of public feedback on tracked bills — sentiment scored and
