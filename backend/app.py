@@ -1,11 +1,9 @@
 """
 JanMat — the entire backend in one file.
-
 Sections below, top to bottom: config, database, scraper, NLP pipeline,
 FastAPI app + routes, and a thin Gradio wrapper around all of it. The
 Vercel frontend reads from the FastAPI routes, and a GitHub Actions cron
 calls POST /internal/run-pipeline on a schedule.
-
 Deployment note: this runs as an HF Space with sdk: gradio (not Docker).
 As of mid-2026, HF Spaces requires a paid plan to create Gradio or Docker
 Spaces UNLESS the Space declares ZeroGPU usage, in which case free
@@ -123,7 +121,6 @@ CREATE TABLE IF NOT EXISTS bills (
     status TEXT,
     scraped_at TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bill_id INTEGER NOT NULL REFERENCES bills(id),
@@ -136,7 +133,6 @@ CREATE TABLE IF NOT EXISTS comments (
     sentiment_score REAL,
     theme_id INTEGER
 );
-
 CREATE TABLE IF NOT EXISTS themes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bill_id INTEGER NOT NULL REFERENCES bills(id),
@@ -146,7 +142,6 @@ CREATE TABLE IF NOT EXISTS themes (
     avg_sentiment REAL,
     generated_at TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -154,7 +149,6 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     status TEXT NOT NULL,
     detail TEXT
 );
-
 CREATE INDEX IF NOT EXISTS idx_comments_bill ON comments(bill_id);
 CREATE INDEX IF NOT EXISTS idx_themes_bill ON themes(bill_id);
 """
@@ -761,5 +755,16 @@ app = gr.mount_gradio_app(app, demo, path="/ui")
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
+
+    # ZeroGPU's worker mechanism (the `spaces` package) spawns a subprocess
+    # to isolate the CUDA context for @zero_gpu-decorated calls. With
+    # Python's "spawn" start method that subprocess re-imports this file as
+    # __main__, which would otherwise re-run this block and try to bind
+    # 0.0.0.0:7860 a second time while the parent still holds it — causing
+    # "address already in use" on Spaces. Only the real main process (not a
+    # spawned worker, which gets a name like "SpawnProcess-1") should launch
+    # the server.
+    if mp.current_process().name == "MainProcess":
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
