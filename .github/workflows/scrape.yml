@@ -3,6 +3,13 @@ name: Scheduled scrape + NLP pipeline
 # Calls the live HF Space's protected endpoint on a schedule, so the
 # scraper and Groq calls run in the Space's own environment/storage
 # rather than in CI (avoids syncing SQLite between two runtimes).
+#
+# /internal/run-pipeline is fire-and-forget: it kicks off the pipeline
+# on a background thread in the Space and returns almost instantly
+# (HTTP 202), rather than holding the connection open for the whole
+# scrape+LLM run. That's what was causing curl exit 28 / timeouts
+# before — a run over ~hundreds of bills could outlast any timeout
+# CI/proxies were willing to tolerate on a synchronous call.
 on:
   schedule:
     - cron: "0 */6 * * *"   # every 6 hours - adjust to taste
@@ -12,7 +19,7 @@ jobs:
   trigger-pipeline:
     runs-on: ubuntu-latest
     steps:
-      - name: Call /internal/run-pipeline on the HF Space
+      - name: Trigger /internal/run-pipeline on the HF Space
         env:
           BACKEND_URL: ${{ secrets.BACKEND_URL }}       # e.g. https://your-space.hf.space
           CRON_SECRET: ${{ secrets.CRON_SECRET }}        # must match the Space's CRON_SECRET
@@ -21,10 +28,39 @@ jobs:
           http_code=$(curl -s -o response.json -w "%{http_code}" \
             -X POST "$BACKEND_URL/internal/run-pipeline" \
             -H "X-Cron-Secret: $CRON_SECRET" \
-            --max-time 300)
-          echo "Response:"
+            --max-time 60)
+          echo "Trigger response (HTTP $http_code):"
           cat response.json
+          echo ""
+
+          if [ "$http_code" = "409" ]; then
+            echo "A previous run was still in progress — skipping this cycle, nothing to fix."
+            exit 0
+          fi
           if [ "$http_code" -ge 300 ]; then
-            echo "Pipeline call failed with HTTP $http_code"
+            echo "Trigger call failed with HTTP $http_code"
             exit 1
           fi
+
+      - name: Poll /internal/pipeline-status until it finishes (best-effort)
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          # Informational only — never fails the job. The pipeline keeps
+          # running server-side in the Space regardless of whether this
+          # loop is still watching, so there's nothing to "fix" if it
+          # times out here; it's just extra visibility in the CI log.
+          for i in $(seq 1 30); do
+            sleep 20
+            resp=$(curl -s --max-time 30 \
+              -H "X-Cron-Secret: $CRON_SECRET" \
+              "$BACKEND_URL/internal/pipeline-status" || echo '{}')
+            echo "[poll $i] $resp"
+            running=$(echo "$resp" | grep -o '"currently_running":[a-z]*' | cut -d: -f2)
+            if [ "$running" = "false" ]; then
+              echo "Pipeline finished."
+              exit 0
+            fi
+          done
+          echo "Still running after ~10 minutes of polling — check the HF Space logs or /internal/pipeline-status directly for the final result."
