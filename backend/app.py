@@ -88,10 +88,11 @@ CONFIG = {
         # real filtering work of keeping out category/nav links.
         "bill_link_pattern": r"^/billtrack/[^/]+$",
         "bill_link_exclude_prefixes": ("/billtrack/category/", "/billtrack/field_bill_category/"),
-        "selectors": {
-            "analysis_section": "div.stakeholder-analysis",
-            "analysis_paragraph": "p",
-        },
+        # No "selectors" dict here anymore — fetch_comments() (PRSScraper,
+        # below) also turned out to be matching a container class
+        # (div.stakeholder-analysis) that doesn't exist on real bill
+        # pages, confirmed 2026-08-24. It now filters paragraphs/list
+        # items by content shape instead; see fetch_comments' docstring.
         "rate_limit_seconds": 2,
         # Keeps each run bounded — the live listing has hundreds of bills,
         # and re-walking the whole archive every 6 hours (each with a
@@ -430,33 +431,72 @@ class PRSScraper:
             )
         return bills
 
+    # Paragraphs/list items containing any of these are boilerplate, not
+    # actual bill analysis — confirmed by inspecting a real bill page.
+    _BOILERPLATE_MARKERS = (
+        "disclaimer:",
+        "is being furnished to you for your information",
+        "not-for-profit group",
+        "copyright ©",
+        "licensed under a creative commons",
+        "may choose to reproduce or redistribute",
+    )
+
     def fetch_comments(self, bill: ScrapedBill) -> List[ScrapedComment]:
         """
         PRS doesn't host raw citizen comments — it hosts structured
-        stakeholder analysis. Each analysis paragraph becomes one
+        analysis (a "Legislative Brief": intro + Key Features + Issues to
+        Consider). Each substantive paragraph/list item becomes one
         "comment" unit so it flows through the same sentiment/clustering
         pipeline a real comment would.
+
+        NOTE: there is no div.stakeholder-analysis (or similar) container
+        on real PRS bill pages — confirmed 2026-08-24 against a live bill
+        page. Real content is plain <p>/<li> text mixed in with nav links,
+        a legal disclaimer, and (for some bills) a data-heavy Annexure
+        table. So instead of a container selector, this filters site-wide
+        paragraphs/list items down to substantive prose by: minimum
+        length, excluding known boilerplate phrases, and excluding rows
+        that are mostly digits (Annexure-style data tables).
         """
-        sel = self.config["selectors"]
         resp = self._get(bill.url)
         soup = BeautifulSoup(resp.text, "lxml")
 
-        section = soup.select_one(sel["analysis_section"])
-        if not section:
-            return []
-
+        all_elements = soup.find_all(["p", "li"])
         comments = []
-        for para in section.select(sel["analysis_paragraph"]):
-            text = para.get_text(strip=True)
-            if len(text) < 40:  # skip stray short fragments/captions
+        seen_texts = set()
+        dropped_short = dropped_boilerplate = dropped_digitheavy = dropped_dup = 0
+        for el in all_elements:
+            text = el.get_text(strip=True)
+            if len(text) < 40:
+                dropped_short += 1
                 continue
+            lowered = text.lower()
+            if any(marker in lowered for marker in self._BOILERPLATE_MARKERS):
+                dropped_boilerplate += 1
+                continue
+            digit_ratio = sum(ch.isdigit() for ch in text) / len(text)
+            if digit_ratio > 0.15:
+                dropped_digitheavy += 1
+                continue
+            if text in seen_texts:
+                dropped_dup += 1
+                continue
+            seen_texts.add(text)
             comments.append(
                 ScrapedComment(
                     bill_url=bill.url,
-                    author="PRS Legislative Research (stakeholder analysis)",
+                    author="PRS Legislative Research (bill analysis)",
                     body=text,
                 )
             )
+
+        logger.info(
+            "PRS bill-page diagnostics (%s): total_p_li=%s kept=%s "
+            "dropped_short=%s dropped_boilerplate=%s dropped_digitheavy=%s dropped_dup=%s",
+            bill.url, len(all_elements), len(comments),
+            dropped_short, dropped_boilerplate, dropped_digitheavy, dropped_dup,
+        )
         return comments
 
     def run(self) -> List[tuple]:
