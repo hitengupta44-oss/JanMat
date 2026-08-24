@@ -1,9 +1,11 @@
 """
 JanMat — the entire backend in one file.
+
 Sections below, top to bottom: config, database, scraper, NLP pipeline,
 FastAPI app + routes, and a thin Gradio wrapper around all of it. The
 Vercel frontend reads from the FastAPI routes, and a GitHub Actions cron
 calls POST /internal/run-pipeline on a schedule.
+
 Deployment note: this runs as an HF Space with sdk: gradio (not Docker).
 As of mid-2026, HF Spaces requires a paid plan to create Gradio or Docker
 Spaces UNLESS the Space declares ZeroGPU usage, in which case free
@@ -65,17 +67,26 @@ CONFIG = {
         "name": "PRS Legislative Research",
         "base_url": "https://prsindia.org",
         "listing_url": "https://prsindia.org/billtrack",
-        # NOTE (honest caveat): these selectors are structurally reasonable
-        # placeholders, unverified against the live DOM. This sandbox cannot
-        # reach prsindia.org (network restricted to package registries), so
-        # the scraper is only tested for logic correctness (config loading,
-        # dedup, parsing) — not against the live site. A human must confirm
-        # these selectors before the first real run.
+        # NOTE: the CSS-class selectors this used to have (div.bill-item,
+        # h3.bill-title, span.bill-status, ...) were unverified guesses
+        # and never matched the real DOM — the scraper always silently
+        # found 0 bills, which is why "No entries yet" never went away.
+        # Confirmed 2026-08-23 against the live page: every bill is
+        # rendered as a heading (h1-h6) containing a link to
+        # /billtrack/{slug}, immediately followed by a status text node
+        # (e.g. "Passed", "Pending", "In Committee"). fetch_bills() below
+        # now matches on that structure instead of guessing class names,
+        # so it survives PRS restyling their markup/CSS later. Category
+        # nav links (/billtrack/category/..., /billtrack/field_bill_category/...)
+        # are explicitly excluded via bill_link_exclude_prefixes.
+        # Matches any single path segment under /billtrack/ (no further
+        # slashes) — deliberately permissive on characters, since real
+        # slugs include apostrophes/smart-quotes (e.g. the "Bankers’
+        # Books Evidence Bill" slug). Exclusion prefixes below do the
+        # real filtering work of keeping out category/nav links.
+        "bill_link_pattern": r"^/billtrack/[^/]+$",
+        "bill_link_exclude_prefixes": ("/billtrack/category/", "/billtrack/field_bill_category/"),
         "selectors": {
-            "bill_card": "div.bill-item",
-            "bill_title": "h3.bill-title a",
-            "bill_link_attr": "href",
-            "bill_status": "span.bill-status",
             "analysis_section": "div.stakeholder-analysis",
             "analysis_paragraph": "p",
         },
@@ -121,6 +132,7 @@ CREATE TABLE IF NOT EXISTS bills (
     status TEXT,
     scraped_at TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bill_id INTEGER NOT NULL REFERENCES bills(id),
@@ -133,6 +145,7 @@ CREATE TABLE IF NOT EXISTS comments (
     sentiment_score REAL,
     theme_id INTEGER
 );
+
 CREATE TABLE IF NOT EXISTS themes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bill_id INTEGER NOT NULL REFERENCES bills(id),
@@ -142,6 +155,7 @@ CREATE TABLE IF NOT EXISTS themes (
     avg_sentiment REAL,
     generated_at TEXT NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -149,6 +163,7 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     status TEXT NOT NULL,
     detail TEXT
 );
+
 CREATE INDEX IF NOT EXISTS idx_comments_bill ON comments(bill_id);
 CREATE INDEX IF NOT EXISTS idx_themes_bill ON themes(bill_id);
 """
@@ -323,23 +338,83 @@ class PRSScraper:
         return resp
 
     def fetch_bills(self) -> List[ScrapedBill]:
-        sel = self.config["selectors"]
+        import re
+
+        link_pattern = re.compile(self.config["bill_link_pattern"])
+        exclude_prefixes = self.config["bill_link_exclude_prefixes"]
+
         resp = self._get(self.config["listing_url"])
         soup = BeautifulSoup(resp.text, "lxml")
 
+        # --- TEMPORARY DIAGNOSTICS (remove once real bills start showing up) ---
+        # These log to the Space's container logs, not the pipeline JSON
+        # response, so check "Logs" in the HF Space UI after triggering a
+        # run. This tells us which of three failure modes we're in:
+        #   1. Got redirected / non-200 / a bot-challenge page instead of
+        #      the real listing (status_code / final_url / title below).
+        #   2. Got real HTML but it's a JS-only shell that renders bills
+        #      client-side, so requests+BeautifulSoup never sees them
+        #      (raw_href_count would be 0 even though the live page has
+        #      hundreds of bills).
+        #   3. Got the real server-rendered HTML with the links present,
+        #      but the heading/next-sibling structure assumption is wrong
+        #      (raw_href_count > 0 but heading_match_count == 0).
+        raw_href_count = len(re.findall(r'href="(/billtrack/[^"]+)"', resp.text))
+        heading_count = len(soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]))
+        title_tag = soup.find("title")
+        logger.info(
+            "PRS scraper diagnostics: status=%s final_url=%s content_length=%s "
+            "page_title=%r raw_href_count=%s heading_tag_count=%s",
+            resp.status_code,
+            resp.url,
+            len(resp.text),
+            title_tag.get_text(strip=True) if title_tag else None,
+            raw_href_count,
+            heading_count,
+        )
+        if raw_href_count == 0:
+            # Log a chunk of the raw response so we can eyeball whether it's
+            # a bot-block/captcha page, a redirect to a login/consent page,
+            # or a near-empty JS shell (e.g. <div id="app"></div>).
+            logger.info("PRS scraper raw response head (first 1500 chars): %r", resp.text[:1500])
+        # --- END TEMPORARY DIAGNOSTICS ---
+
         bills = []
-        for card in soup.select(sel["bill_card"]):
-            title_el = card.select_one(sel["bill_title"])
-            if not title_el:
+        seen_urls = set()
+        for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+            link = heading.find("a", href=True)
+            if not link:
                 continue
-            href = title_el.get(sel["bill_link_attr"], "")
+            href = link["href"]
+            path = href if href.startswith("/") else href.replace(self.config["base_url"], "", 1)
+            if any(path.startswith(p) for p in exclude_prefixes):
+                continue
+            if not link_pattern.match(path):
+                continue
+
             url = href if href.startswith("http") else self.config["base_url"] + href
-            status_el = card.select_one(sel["bill_status"])
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            # Status is the text immediately following the heading (a plain
+            # text node or the next small element) — not itself a link.
+            status = None
+            node = heading.find_next_sibling()
+            while node is not None and not node.get_text(strip=True):
+                node = node.find_next_sibling()
+            if node is not None:
+                candidate = node.get_text(strip=True)
+                # Guard against accidentally grabbing the *next* bill's
+                # heading if there's no distinct status element between them.
+                if candidate and node.name not in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                    status = candidate
+
             bills.append(
                 ScrapedBill(
-                    title=title_el.get_text(strip=True),
+                    title=link.get_text(strip=True),
                     url=url,
-                    status=status_el.get_text(strip=True) if status_el else None,
+                    status=status,
                 )
             )
         return bills
