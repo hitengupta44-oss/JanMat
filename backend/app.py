@@ -117,7 +117,7 @@ CONFIG = {
     },
     "nlp": {
         "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-20b",
         "max_comments_per_batch": 20,
         "clustering": {
             "min_k": 3,
@@ -524,7 +524,11 @@ class PRSScraper:
 # =====================================================================
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "llama-3.1-8b-instant"
+# Groq deprecated llama-3.1-8b-instant (announced 2026-06-17); by
+# 2026-08-24 it's fully decommissioned and returns 404 instead of a
+# softer 400 model_decommissioned error. openai/gpt-oss-20b is Groq's
+# recommended replacement. See https://console.groq.com/docs/deprecations
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 
 class GroqError(RuntimeError):
@@ -559,6 +563,15 @@ def call_groq_json(system_prompt: str, user_prompt: str, model: str = DEFAULT_MO
                 logger.warning("Groq rate-limited, backing off %ss", wait)
                 time.sleep(wait)
                 continue
+            if resp.status_code in (400, 404):
+                # Bad model name / malformed request — retrying with the
+                # same payload will never succeed, so fail immediately
+                # instead of burning 3 attempts x backoff sleep per call.
+                raise GroqError(
+                    f"Groq call failed with {resp.status_code} for model "
+                    f"{model!r} — not retrying (this is a request/model "
+                    f"problem, not transient): {resp.text[:300]}"
+                )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
             return json.loads(content)
