@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -91,6 +93,15 @@ CONFIG = {
             "analysis_paragraph": "p",
         },
         "rate_limit_seconds": 2,
+        # Keeps each run bounded — the live listing has hundreds of bills,
+        # and re-walking the whole archive every 6 hours (each with a
+        # rate-limited fetch + Groq call) isn't necessary for a demo and
+        # was blowing past the CI curl timeout. fetch_bills() returns the
+        # listing in page order (newest first), so this naturally prioritizes
+        # recent/active bills. Raise this once the DB has caught up on
+        # backlog, or once duplicate-skipping (bills already in the DB)
+        # is confirmed to make later runs fast regardless.
+        "max_bills_per_run": 25,
         # PRS's disclaimer permits reproduction "for non-commercial purposes...
         # with due acknowledgement of PRS Legislative Research." This deployment
         # is free/non-commercial and always attributes PRS in the UI.
@@ -451,7 +462,11 @@ class PRSScraper:
     def run(self) -> List[tuple]:
         """Returns [(ScrapedBill, [ScrapedComment, ...]), ...]."""
         results = []
-        for bill in self.fetch_bills():
+        limit = self.config.get("max_bills_per_run")
+        bills = self.fetch_bills()
+        if limit is not None:
+            bills = bills[:limit]
+        for bill in bills:
             try:
                 comments = self.fetch_comments(bill)
             except Exception as exc:  # one bad bill shouldn't kill the run
@@ -613,6 +628,15 @@ def summarize_cluster(comments: List[str], fallback_keywords: List[str], model: 
         }
 
 
+# Tracks whether a background pipeline run is currently in flight, so the
+# fire-and-forget endpoint below can refuse to overlap two runs (e.g. a
+# slow run still going when the next 6-hour cron tick fires) and so
+# /internal/pipeline-status has something to report immediately, before
+# the row even lands in pipeline_runs.
+_pipeline_lock = threading.Lock()
+_pipeline_state = {"running": False, "started_at": None}
+
+
 def run_pipeline() -> dict:
     """
     One full run: scrape PRS -> dedup-insert into SQLite -> score sentiment
@@ -674,14 +698,14 @@ def run_pipeline() -> dict:
 
             conn.execute(
                 "UPDATE pipeline_runs SET finished_at = ?, status = ?, detail = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), "success", str(summary), run_id),
+                (datetime.now(timezone.utc).isoformat(), "success", json.dumps(summary), run_id),
             )
         except Exception as exc:
             logger.exception("Pipeline run failed")
             summary["errors"].append(str(exc))
             conn.execute(
                 "UPDATE pipeline_runs SET finished_at = ?, status = ?, detail = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), "failed", str(exc), run_id),
+                (datetime.now(timezone.utc).isoformat(), "failed", json.dumps({"error": str(exc)}), run_id),
             )
 
     return summary
@@ -771,16 +795,97 @@ def bill_sentiment_summary(bill_id: int):
         return get_bill_sentiment_summary(conn, bill_id)
 
 
-@app.post("/internal/run-pipeline", response_model=PipelineRunResult)
+def _run_pipeline_in_background():
+    try:
+        run_pipeline()
+    except Exception:
+        logger.exception("Background pipeline run crashed")
+    finally:
+        with _pipeline_lock:
+            _pipeline_state["running"] = False
+
+
+@app.post("/internal/run-pipeline")
 def trigger_pipeline(x_cron_secret: str = Header(default="")):
     """
     Called by the GitHub Actions cron job (see .github/workflows/scrape.yml).
     Protected by a shared secret so random internet traffic can't trigger
     scrapes/LLM spend.
+
+    Fire-and-forget: kicks off the scrape+NLP pipeline on a background
+    thread and returns immediately (HTTP 202), instead of holding the
+    connection open for the full run. A run over a few hundred bills with
+    rate-limited requests + Groq calls can take well past what CI/proxy
+    timeouts tolerate on a synchronous call — this avoids that entirely.
+    Poll GET /internal/pipeline-status (same header) to check on it.
     """
     if not CRON_SECRET or x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Cron-Secret header")
-    return run_pipeline()
+
+    with _pipeline_lock:
+        if _pipeline_state["running"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "already_running",
+                    "started_at": _pipeline_state["started_at"],
+                    "detail": "A pipeline run is already in progress; not starting a second one.",
+                },
+            )
+        _pipeline_state["running"] = True
+        _pipeline_state["started_at"] = datetime.now(timezone.utc).isoformat()
+
+    thread = threading.Thread(target=_run_pipeline_in_background, daemon=True)
+    thread.start()
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "started",
+            "started_at": _pipeline_state["started_at"],
+            "detail": "Pipeline started in the background. Poll GET /internal/pipeline-status for the result.",
+        },
+    )
+
+
+@app.get("/internal/pipeline-status")
+def pipeline_status(x_cron_secret: str = Header(default="")):
+    """Check on a run kicked off via POST /internal/run-pipeline."""
+    if not CRON_SECRET or x_cron_secret != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Cron-Secret header")
+
+    with _pipeline_lock:
+        currently_running = _pipeline_state["running"]
+        started_at = _pipeline_state["started_at"]
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT started_at, finished_at, status, detail FROM pipeline_runs "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    last_run = None
+    if row is not None:
+        detail = row["detail"]
+        try:
+            parsed_detail = json.loads(detail) if detail else None
+        except (TypeError, ValueError):
+            # Rows written before this fix stored a Python dict repr via
+            # str(summary), not real JSON — surface it as raw text rather
+            # than crashing this endpoint on old data.
+            parsed_detail = {"raw": detail}
+        last_run = {
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "status": row["status"],
+            "detail": parsed_detail,
+        }
+
+    return {
+        "currently_running": currently_running,
+        "current_run_started_at": started_at if currently_running else None,
+        "last_run": last_run,
+    }
 
 
 # =====================================================================
